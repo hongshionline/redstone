@@ -56,7 +56,11 @@ def get_wallpaper():
         wallpaper_path, _ = win32api.RegQueryValueEx(key, "WallPaper")
         win32api.RegCloseKey(key)
         if wallpaper_path and os.path.exists(wallpaper_path):
-            return Image.open(wallpaper_path).convert("RGB")
+            img = Image.open(wallpaper_path)
+            try:
+                return img.convert("RGB")
+            finally:
+                img.close()
     except Exception:
         pass
     return None
@@ -87,8 +91,11 @@ def _load_avg_color():
     if img is None:
         _cached_avg = (0, 120, 212)
     else:
-        stat = ImageStat.Stat(img)
-        _cached_avg = tuple(int(v) for v in stat.mean)
+        try:
+            stat = ImageStat.Stat(img)
+            _cached_avg = tuple(int(v) for v in stat.mean)
+        finally:
+            img.close()
     return _cached_avg
 
 def get_avg_wallpaper_color():
@@ -404,13 +411,14 @@ class App(QMainWindow):
         ip = self._conn_ip.text()
         if ip == "--":
             return
+        import re
         try:
             result = subprocess.run(["ping", "-n", "1", ip],
                                     capture_output=True, text=True, timeout=5)
             for line in result.stdout.splitlines():
-                if "时间=" in line:
-                    ms = line.split("时间=")[-1].split("ms")[0].strip()
-                    self._conn_latency.setText(f"{ms}ms")
+                m = re.search(r"时间[=<]\s*(\d+)\s*ms", line)
+                if m:
+                    self._conn_latency.setText(f"{m.group(1)}ms")
                     return
                 if "TTL=" in line:
                     self._conn_latency.setText("<1ms")
@@ -455,13 +463,18 @@ class App(QMainWindow):
                 data = json.loads(resp.read())
                 self.log.logging(f"创建房间响应: {json.dumps(data, ensure_ascii=False)}")
         except urllib.error.HTTPError as e:
+            err_log = f"HTTP {e.code}"
             try:
-                err = json.loads(e.read())
-                msg = err.get("message", str(e))
-                self.log.logging(f"创建房间失败: {json.dumps(err, ensure_ascii=False)}", type_="[ERROR]")
-            except Exception:
-                msg = f"HTTP {e.code}"
-                self.log.logging(f"创建房间失败: HTTP {e.code}", type_="[ERROR]")
+                err_body = e.read()
+                try:
+                    err = json.loads(err_body)
+                    msg = err.get("message", str(e))
+                    err_log = json.dumps(err, ensure_ascii=False)
+                except Exception:
+                    msg = f"HTTP {e.code}"
+            finally:
+                e.close()
+            self.log.logging(f"创建房间失败: {err_log}", type_="[ERROR]")
             QMessageBox.critical(self, "创建失败", msg)
             return
         except Exception as e:
@@ -524,15 +537,22 @@ class App(QMainWindow):
                         "server_addr": server_addr, "server_port": server_port,
                         "server_name": self._conn_server.text(),
                         "created_at": self._room_created})
-        with open(tunnels_file, "w") as f:
-            json.dump(tunnels, f, indent=2)
+        with open(tunnels_file, "w", encoding="utf-8") as f:
+            json.dump(tunnels, f, indent=2, ensure_ascii=False)
         self.log.logging(f"房间已创建: {server_addr}:{remote_port}")
 
     def _destroy_room(self, api=True):
         if self._frpc_proc is not None:
             try:
                 self._frpc_proc.terminate()
-                self._frpc_proc.wait(timeout=3)
+                try:
+                    self._frpc_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._frpc_proc.kill()
+                    try:
+                        self._frpc_proc.wait(timeout=2)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             self._frpc_proc = None
@@ -610,6 +630,9 @@ class App(QMainWindow):
             self._destroy_existing_tunnel(ip, apikey, tunnel_id)
 
     def _restore_tunnel(self, saved):
+        if self._frpc_proc is not None or self._room_created is not None:
+            QMessageBox.warning(self, "提示", "请先销毁当前房间再恢复")
+            return
         self._tunnel_id = saved["tunnel_id"]
         self._conn_ip.setText(saved.get("ip", ""))
         name = saved.get("server_name", "")
@@ -755,8 +778,11 @@ class App(QMainWindow):
                 w.setParent(None)
                 w.deleteLater()
 
-        with open(os.path.join(CONFIG_PATH, "config.json"), "r", encoding="utf-8") as f:
-            config = json.load(f)
+        try:
+            with open(os.path.join(CONFIG_PATH, "config.json"), "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
         selected = config.get("selected_server", "")
 
         for s in servers:
@@ -815,16 +841,17 @@ class App(QMainWindow):
         return card
 
     def _ping_server(self, ip, latency_label):
+        import re
         try:
             result = subprocess.run(["ping", "-n", "1", ip],
                                     capture_output=True, text=True, timeout=5)
             for line in result.stdout.splitlines():
-                if "时间=" in line or "TTL=" in line:
-                    ms = line.split("时间=")[-1].split("ms")[0].strip() if "时间=" in line else ""
-                    if ms:
-                        latency_label.setText(f"延迟: {ms}ms")
-                    else:
-                        latency_label.setText("延迟: <1ms")
+                m = re.search(r"时间[=<]\s*(\d+)\s*ms", line)
+                if m:
+                    latency_label.setText(f"延迟: {m.group(1)}ms")
+                    return
+                if "TTL=" in line:
+                    latency_label.setText("延迟: <1ms")
                     return
             latency_label.setText("延迟: 超时")
         except Exception:
@@ -895,13 +922,22 @@ class App(QMainWindow):
                 self.log.logging(f"注册成功({name}): {result.get('message', '')}")
             self._select_server(name)
         except urllib.error.HTTPError as e:
+            err_log = f"HTTP {e.code}"
             try:
-                err = json.loads(e.read())
-                self.log.logging(f"注册失败({name}): {json.dumps(err, ensure_ascii=False)}", type_="[ERROR]")
-            except Exception:
-                self.log.logging(f"注册失败({name}): HTTP {e.code}", type_="[ERROR]")
+                err_body = e.read()
+                try:
+                    err = json.loads(err_body)
+                    err_log = json.dumps(err, ensure_ascii=False)
+                    msg = err.get("message", f"HTTP {e.code}")
+                except Exception:
+                    msg = f"HTTP {e.code}"
+            finally:
+                e.close()
+            self.log.logging(f"注册失败({name}): {err_log}", type_="[ERROR]")
+            QMessageBox.critical(self, "注册失败", f"{name}：{msg}")
         except Exception as e:
             self.log.logging(f"注册失败({name}): {e}", type_="[ERROR]")
+            QMessageBox.critical(self, "注册失败", f"{name}：{e}")
 
     def _build_version_page(self):
         page = self.stack.widget(3)

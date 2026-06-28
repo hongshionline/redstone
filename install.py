@@ -123,8 +123,16 @@ def on_agree_changed(*_):
     btn_next.config(state="normal" if agree_var.get() else "disabled")
 agree_var.trace_add("write", on_agree_changed)
 
+try:
+    log_file = open(os.path.join(BASE_DIR, "log.txt"), "w", encoding="utf-8")
+except Exception:
+    log_file = None
+
 def cancel():
-    log_file.close()
+    try:
+        log_file.close()
+    except Exception:
+        pass
     root.destroy()
 btn_cancel1.config(command=cancel)
 
@@ -188,7 +196,6 @@ btn_finish = ttk.Button(inst_frame, text="完成", state="disabled")
 btn_finish.place(relx=0.88, rely=0.85, anchor="center")
 
 aborted = False
-log_file = open(os.path.join(BASE_DIR, "log.txt"), "w", encoding="utf-8")
 
 def log(msg):
     t = time.strftime("%H:%M:%S")
@@ -198,11 +205,23 @@ def log(msg):
         log_text.see("end"),
         log_text.config(state="disabled")
     ))
-    log_file.write(f"[{t}] {msg}\n")
-    log_file.flush()
+    if log_file is not None:
+        try:
+            log_file.write(f"[{t}] {msg}\n")
+            log_file.flush()
+        except Exception:
+            pass
 
 def set_prog(val):
     root.after(0, lambda: prog.config(value=val))
+
+def _ps_escape_double(path):
+    """转义用于 PowerShell 双引号字符串的路径（转义 " $ ` ）"""
+    return path.replace('`', '``').replace('$', '`$').replace('"', '`"')
+
+def _ps_escape_single(path):
+    """转义用于 PowerShell 单引号字符串的路径（将 ' 替换为 ''）"""
+    return path.replace("'", "''")
 
 def run_powershell(cmd, log_msg, err_ok=(0x800106ba,)):
     log(log_msg)
@@ -228,7 +247,7 @@ def do_install():
     # 1. 添加安装文件夹白名单
     log("--- [1/5] Windows 安全中心白名单设置 ---")
     log(f"目标目录：{dest}")
-    run_powershell(f'Add-MpPreference -ExclusionPath "{dest}"', "正在添加安装目录到 Windows Defender 排除列表...")
+    run_powershell(f'Add-MpPreference -ExclusionPath "{_ps_escape_double(dest)}"', "正在添加安装目录到 Windows Defender 排除列表...")
     if aborted: return
     set_prog(15)
 
@@ -242,6 +261,11 @@ def do_install():
             files = z.namelist()
             log(f"压缩包内文件数：{len(files)}")
             log(f"正在解压到：{dest}")
+            dest_real = os.path.realpath(dest)
+            for member in z.infolist():
+                member_path = os.path.realpath(os.path.join(dest_real, member.filename))
+                if not member_path.startswith(dest_real + os.sep) and member_path != dest_real:
+                    raise ValueError(f"非法压缩包条目（路径越界）: {member.filename}")
             z.extractall(dest)
         log("✓ 解压完成")
     except Exception as e:
@@ -256,7 +280,7 @@ def do_install():
     log(f"FRPC 路径：{frpc_path}")
     if os.path.exists(frpc_path):
         log(f"FRPC 大小：{os.path.getsize(frpc_path) / 1024:.1f} KB")
-    run_powershell(f'Add-MpPreference -ExclusionPath "{frpc_path}"', "正在添加 frpc.exe 到 Windows Defender 排除列表...")
+    run_powershell(f'Add-MpPreference -ExclusionPath "{_ps_escape_double(frpc_path)}"', "正在添加 frpc.exe 到 Windows Defender 排除列表...")
     if aborted: return
     set_prog(60)
 
@@ -270,9 +294,9 @@ def do_install():
         log(f"快捷方式路径：{lnk}")
         ws_ps = f'''
 $ws = New-Object -ComObject WScript.Shell
-$s = $ws.CreateShortcut('{lnk}')
-$s.TargetPath = '{exe_path}'
-$s.WorkingDirectory = '{os.path.dirname(exe_path)}'
+$s = $ws.CreateShortcut('{_ps_escape_single(lnk)}')
+$s.TargetPath = '{_ps_escape_single(exe_path)}'
+$s.WorkingDirectory = '{_ps_escape_single(os.path.dirname(exe_path))}'
 $s.Save()
 '''
         log("正在创建桌面快捷方式...")
