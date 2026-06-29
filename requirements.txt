@@ -1,0 +1,6 @@
+PySide6>=6.6
+Pillow>=10.0
+pywin32>=306; platform_system == "Windows"
+darkdetect>=0.8
+pywinstyles>=1.8; platform_system == "Windows"
+hPyT>=1.4; platform_system == "Windows"
